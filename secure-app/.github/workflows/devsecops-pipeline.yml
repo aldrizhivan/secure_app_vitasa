@@ -1,0 +1,101 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+
+  scan:
+    name: Security Scans
+    runs-on: ubuntu-latest
+
+    outputs:
+      scan_status: ${{ steps.set_status.outputs.status }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Dependency Scan
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt -f json -o pip-audit-report.json
+
+      # SAST (Semgrep)
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: .semgrep.yml
+          generateSarif: "1"
+
+      # Secret Scan (Gitleaks)
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --report-path=gitleaks-report.json
+
+      - name: Upload Scan Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            pip-audit-report.json
+            gitleaks-report.json
+
+      - name: Set status
+        id: set_status
+        run: echo "status=passed" >> $GITHUB_OUTPUT
+
+
+  build:
+    name: Build, SBOM, and Container Scan
+    runs-on: ubuntu-latest
+    needs: scan
+
+    if: needs.scan.outputs.scan_status == 'passed'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set Image Tag
+        run: echo "IMAGE_TAG=secure-app:${GITHUB_SHA}" >> $GITHUB_ENV
+
+      # Build container
+      - name: Build Docker image
+        run: docker build -t $IMAGE_TAG .
+
+      # Generate SBOM (Syft)
+      - name: Generate SBOM
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh
+          ./bin/syft $IMAGE_TAG -o cyclonedx-json > sbom.json
+
+      # Container Scan (Grype)
+      - name: Scan container image
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh
+          ./bin/grype $IMAGE_TAG -o json > grype-report.json
+
+      # Mark trusted build
+      - name: Mark Trusted Build
+        run: echo "TRUSTED_BUILD=true" >> $GITHUB_ENV
+
+      - name: Save Image Metadata
+        run: |
+          echo "image=$IMAGE_TAG" > image-info.txt
+          echo "trusted=$TRUSTED_BUILD" >> image-info.txt
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            sbom.json
+            grype-report.json
+            image-info.txt
